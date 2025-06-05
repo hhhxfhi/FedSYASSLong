@@ -1,0 +1,15 @@
+num_repeat_times: 10     #表示实验重复的次数
+distribution: dirichlet   #狄利克雷分布
+alpha: 0.1  # 仅对狄利克雷分布有效，控制Dirichlet分布的浓度
+
+server:
+  global_rounds: 50
+  lowest_join_rate: 1
+  lambdaWeight: 0.8
+
+client:
+  num_clients: 20
+  num_classes_per_client: 2
+  batch_size: 64
+  learning_rate: 0.01
+  local_epochs: 2
