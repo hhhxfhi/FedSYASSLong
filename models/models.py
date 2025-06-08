@@ -2,10 +2,12 @@ import copy
 
 import torch
 from torch import nn
-
+# from src.FedPSYSSALong.FedMHA import *
+from models.MultiHeadAttention import MultiHeadAttention
 
 class Net(nn.Module):
-    def __init__(self, in_channels, num_classes, dim):
+    def __init__(self, in_channels, num_classes, dim,
+                 num_heads=4, attn_dropout=0.1, proj_dropout=0.1):
         super().__init__()
         self.conv1 = nn.Sequential(
             nn.Conv2d(in_channels=in_channels,
@@ -27,6 +29,12 @@ class Net(nn.Module):
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2)
         )
+        # 多头注意力机制
+        self.multi_head = MultiHeadAttention(embed_dim=dim,
+                                             num_heads=num_heads,
+                                             attn_dropout=attn_dropout,
+                                             proj_dropout=proj_dropout)
+
         self.fc1 = nn.Sequential(
             nn.Linear(dim, 120),
             nn.ReLU(inplace=True)
@@ -41,7 +49,11 @@ class Net(nn.Module):
         out = self.conv1(x)
         out = self.conv2(out)
         out = torch.flatten(out, start_dim=1)
-        out = self.fc1(out)
+        # 多头注意力机制
+        temp_out = out.unsqueeze(1)
+        temp_out = self.multi_head(temp_out).squeeze(1)
+
+        out = self.fc1(temp_out)
         out = self.fc2(out)
         out = self.fc(out)
         return out
@@ -151,7 +163,6 @@ class BaseHeadSplit(nn.Module):
         return out
 
 
-
 class Head(nn.Module):
     def __init__(self, num_classes=10, hidden_dims=[512]):
         super().__init__()
@@ -169,12 +180,10 @@ class Head(nn.Module):
         return out
 
 
-
-
-
 ######################################################
 class LeNet5(nn.Module):
-    def __init__(self, in_channels, num_classes, dim):
+    def __init__(self, in_channels, num_classes, dim,
+                 num_heads=4, attn_dropout=0.1, proj_dropout=0.1):
         super().__init__()
         self.conv1 = nn.Sequential(
             nn.Conv2d(in_channels=in_channels,
@@ -196,6 +205,11 @@ class LeNet5(nn.Module):
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2)
         )
+
+        # 多头注意力模块
+        self.embed_dim = dim
+        self.multi_head = MultiHeadAttention(self.embed_dim, num_heads, attn_dropout, proj_dropout)
+
         self.fc1 = nn.Sequential(
             nn.Linear(dim, 120),
             nn.ReLU(inplace=True)
@@ -210,21 +224,22 @@ class LeNet5(nn.Module):
         out = self.conv1(x)
         out = self.conv2(out)
         out = torch.flatten(out, start_dim=1)
-        out = self.fc1(out)
+        # 多头注意力计算
+        temp_out = out.unsqueeze(1)
+        temp_out = self.multi_head(temp_out).squeeze(1)
+
+        out = self.fc1(temp_out)
         out = self.fc2(out)
         out = self.fc(out)
         return out
-
-
-
-
 
 
 ###########################################################
 
 class CNN(nn.Module):
     def __init__(self, in_features=1, num_classes=10, height=28,
-                 num_cov=2, feature_dim=512, hidden_dims=[]):
+                 num_cov=2, feature_dim=512, hidden_dims=[],
+                 num_heads=4, attn_dropout=0.1, proj_dropout=0.1):
         super().__init__()
         convs = [nn.Sequential(
             nn.Conv2d(in_features,
@@ -256,6 +271,12 @@ class CNN(nn.Module):
 
         hidden_dims.append(feature_dim)
 
+        # 多头注意力机制
+        self.multi_head = MultiHeadAttention(embed_dim=feature_dim,
+                                             num_heads=num_heads,
+                                             attn_dropout=attn_dropout,
+                                             proj_dropout=proj_dropout)
+
         layers = [nn.Flatten()]
         for idx in range(len(hidden_dims)):
             if len(layers) == 1:
@@ -270,7 +291,12 @@ class CNN(nn.Module):
 
     def forward(self, x):
         out = self.conv(x)
-        out = self.fc1(out)
+        # 调度多头注意力机制
+        batch_size = out.size(0)
+        out_flat = out.view(batch_size, -1).unsqueeze(1)
+        temp_out = self.multi_head(out_flat).squeeze(1)
+
+        out = self.fc1(temp_out)
         out = self.fc(out)
         return out
 
@@ -345,7 +371,8 @@ class Digit5CNN(nn.Module):
 
 # https://github.com/FengHZ/KD3A/blob/master/model/amazon.py
 class AmazonMLP(nn.Module):
-    def __init__(self, feature_dim=[500]):
+    def __init__(self, feature_dim=[500],
+                 num_heads=4, attn_dropout=0.1, proj_dropout=0.1):
         super(AmazonMLP, self).__init__()
         self.in_features = 5000
         self.out_features = 100
@@ -357,10 +384,23 @@ class AmazonMLP(nn.Module):
             else:
                 layers.append(nn.Linear(feature_dim[idx - 1], feature_dim[idx]))
                 layers.append(nn.ReLU())
+        # try:
+        #     layers.append(nn.Linear(feature_dim[idx], self.out_features))
+        # except UnboundLocalError:
+        #     layers.append(nn.Linear(self.in_features, self.out_features))
         try:
-            layers.append(nn.Linear(feature_dim[idx], self.out_features))
+            final_dim = feature_dim[idx]
         except UnboundLocalError:
-            layers.append(nn.Linear(self.in_features, self.out_features))
+            final_dim = self.in_features
+
+        # 在编码器和分类器中插入多头注意力机制
+        self.multi_head = MultiHeadAttention(embed_dim=self.out_features,
+                                             num_heads=num_heads,
+                                             attn_dropout=attn_dropout,
+                                             proj_dropout=proj_dropout)
+        # 编码器最后一层
+        layers.append(nn.Linear(final_dim, self.out_features))
+
         layers.append(nn.ReLU())
 
         self.encoder = nn.Sequential(*layers)
@@ -368,6 +408,10 @@ class AmazonMLP(nn.Module):
 
     def forward(self, x):
         out = self.encoder(x)
+        # 插入多头注意力机制
+        out = out.unsqueeze(1)  # 调整维度以适应多头注意力机制
+        out = self.multi_head(out).squeeze(1)
+
         out = self.fc(out)
         return out
 
@@ -405,7 +449,8 @@ class AmazonMLP(nn.Module):
 #         return x
 
 class FedAvgCNN(nn.Module):
-    def __init__(self, in_features=1, num_classes=10, dim=1024):
+    def __init__(self, in_features=1, num_classes=10, dim=1024,
+                 num_heads=4, attn_dropout=0.1, proj_dropout=0.1):
         super().__init__()
         self.conv1 = nn.Sequential(
             nn.Conv2d(in_features,
@@ -427,6 +472,12 @@ class FedAvgCNN(nn.Module):
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=(2, 2))
         )
+        # 插入多头注意力机制
+        self.multi_head = MultiHeadAttention(embed_dim=dim,
+                                             num_heads=num_heads,
+                                             attn_dropout=attn_dropout,
+                                             proj_dropout=proj_dropout)
+
         self.fc1 = nn.Sequential(
             nn.Linear(dim, 512),
             nn.ReLU(inplace=True)
@@ -437,6 +488,10 @@ class FedAvgCNN(nn.Module):
         out = self.conv1(x)
         out = self.conv2(out)
         out = torch.flatten(out, 1)
+        # 多头注意力计算
+        out = out.unsqueeze(1)
+        out = self.multi_head(out).squeeze(1)
+
         out = self.fc1(out)
         out = self.fc(out)
         return out
