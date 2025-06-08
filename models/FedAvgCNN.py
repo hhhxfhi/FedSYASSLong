@@ -24,6 +24,11 @@ class FedAvgCNN(nn.Module):
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=(2, 2))
         )
+        # 插入多头注意力机制
+        self.multi_head = MultiHeadAttention(embed_dim=dim,
+                                             num_heads=num_heads,
+                                             attn_dropout=attn_dropout,
+                                             proj_dropout=proj_dropout)
         self.fc1 = nn.Sequential(
             nn.Linear(dim, 512),
             nn.ReLU(inplace=True)
@@ -34,6 +39,9 @@ class FedAvgCNN(nn.Module):
         out = self.conv1(x)
         out = self.conv2(out)
         out = torch.flatten(out, 1)
+        # 多头注意力计算
+        out = out.unsqueeze(1)
+        out = self.multi_head(out).squeeze(1)
         out = self.fc1(out)
         out = self.fc(out)
         return out
