@@ -550,6 +550,7 @@ from collections import defaultdict
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 from src.client_base import ClientBase
 from torch import nn
@@ -563,6 +564,8 @@ class ClientFedPSYSSALong(ClientBase):
     def __init__(self, args, client_id, trainset, testset, statistic):
         super().__init__(args, client_id, trainset, testset, statistic)
 
+        # self.loss = None
+        self.upload_data = None
         self.class_weights = None
         self.private_keys, self.shared_keys = self.get_parameter_keys()
 
@@ -580,10 +583,11 @@ class ClientFedPSYSSALong(ClientBase):
         # self.alpha.data.fill_(0.5)
         self.globalHead = copy.deepcopy(args.head).to(self.device)
         self.globalEpochRound = 0
+        self.proto_weight = {}  # 存储每个类别的置信度分数
         # self.decay_rounds=2
         # self.miu_0 = 0.5 # 0.1,0.3,0.5,0.7,0.9,1.0
 
-        # self.local_protos = {}  # dict
+        self.local_protos = {}  # dict
         # self.global_protos = None  # list
 
         # self.proto_loss = nn.MSELoss()
@@ -626,26 +630,75 @@ class ClientFedPSYSSALong(ClientBase):
             owned.update(y.unique().tolist())
         return list(owned)
 
-    # def aggregate(self, raw_feats):
-    #     for label in raw_feats.keys():
-    #         feats = torch.stack(raw_feats[label], dim=0)
-    #         self.local_protos[label] = torch.mean(feats, dim=0)
+    def get_shared_params(self):
+        """获取共享参数"""
+        return {k: v for k, v in self.model.state_dict().items() if k.startswith('base.')}
 
-    # def collect_feats(self):
-    #     train_loader = self.get_train_loader()
-    #     self.model.eval()
-    #
-    #     raw_feats = defaultdict(list)
-    #     with torch.inference_mode():
-    #         for x, y in train_loader:
-    #             x, y = x.to(self.device), y.to(self.device)
-    #             feature = self.model.base(x)
-    #
-    #             for label in torch.unique(y):
-    #                 protos = feature[label == y].detach()
-    #                 raw_feats[label.item()].extend(list(torch.unbind(protos, dim=0)))
-    #
-    #     return raw_feats
+    def get_private_params(self):
+        """获取私有参数"""
+        return {k: v for k, v in self.model.state_dict().items() if not k.startswith('base.')}
+
+    def set_params(self, params):
+        """加载服务器共享参数（忽略私有参数不匹配）"""
+        model_state = self.model.state_dict()
+
+        # 1. 分离共享参数（假设共享参数以`base.`为前缀）
+        shared_params = {k: v for k, v in params.items() if k.startswith('base.')}
+        model_shared_state = {k: v for k, v in model_state.items() if k.startswith('base.')}
+
+        # 2. 检查参数匹配性（仅警告，不中断）
+        missing_shared = set(model_shared_state.keys()) - set(shared_params.keys())
+        unexpected_shared = set(shared_params.keys()) - set(model_shared_state.keys())
+        if missing_shared:
+            print(f"客户端 {self.client_id} 缺失共享参数: {missing_shared}")
+        if unexpected_shared:
+            print(f"客户端 {self.client_id} 意外共享参数: {unexpected_shared}")
+
+        # 3. 加载共享参数（strict=False允许部分加载）
+        model_shared_state.update(shared_params)
+        self.model.load_state_dict(model_shared_state, strict=False)
+
+    def aggregate(self, raw_feats, raw_scores):
+        """
+        计算置信度
+        :param raw_feats: 原始特征集合，用于构建本地原型
+        :param raw_scores: 原始置信度分数集合，用于评估原型的可靠性
+        """
+        for label, feats in raw_feats.items():
+            feats = F.normalize(torch.stack(feats, dim=0))
+            score = torch.tensor(raw_scores[label])
+            self.local_protos[label] = torch.mean(feats, dim=0)
+            # 计算原型的置信度权重
+            score_proto = F.softmax(self.model.head(self.local_protos[label].unsqueeze(0)), dim=1)
+            # 取原型在对应类别上的预测概率作为置信度
+            self.proto_weight[label] = score_proto[0, label].cpu().detach()
+
+    def collect_feats(self):
+        train_loader = self.get_train_loader()
+        self.model.eval()
+
+        raw_feats = defaultdict(list)
+        raw_scores = defaultdict(list)
+        with torch.inference_mode():
+            for x, y in train_loader:
+                x, y = x.to(self.device), y.to(self.device)
+                feature = self.model.base(x)
+                # 模型输出的类别概率
+                score = F.softmax(self.model.head(feature), dim=1)
+
+                for label in torch.unique(y):
+                    protos = feature[label == y].detach()
+                    raw_feats[label.item()].extend(list(torch.unbind(protos, dim=0)))
+                    # 收集每个样本在真实类别上的预测概率作为置信度分数
+                    raw_scores[label.item()].extend(score[label == y][:, label].detach().cpu().detach())
+
+        return raw_feats, raw_scores
+        # for label in raw_feats.keys():
+        #     if len(raw_feats[label]) > 0:
+        #         proto = torch.mean(torch.stack(raw_feats[label]), dim=0)
+        #         score_proto = F.softmax(self.model.head(proto.unsqueeze(0)), dim=1)
+        #         self.proto_weights[label] = score_proto[0, label].item()
+        # return raw_feats, self.proto_weights
 
     def dict_to_vector(self):
         # 初始化全零向量
@@ -695,8 +748,85 @@ class ClientFedPSYSSALong(ClientBase):
         with torch.no_grad():
             for name, param in self.globalHead.named_parameters():
                 if param.requires_grad:
-                    noise = torch.randn_like(param)*noise_std
-                    param.data = gama*param.data + (1-gama)*noise
+                    noise = torch.randn_like(param) * noise_std
+                    param.data = gama * param.data + (1 - gama) * noise
+
+    def resample_with_class_adaptive_noise(self, min_std=0.005, max_std=0.05):
+        """
+        对每个类别的参数添加类别自适应扰动，稀有类别扰动更强
+        :param min_std: 用于常见类
+        :param max_std: 用于稀有类
+        """
+        global_params = self.globalHead.state_dict()
+
+        # 样本总数和按类别权重归一化
+        class_counts = torch.zeros(self.num_classes)
+        for cls, count in self.statistic.items():
+            class_counts[int(cls)] = count
+        norm_counts = class_counts / (class_counts.sum() + 1e-6)
+        adaptive_weights = 1.0 - norm_counts  # 稀有类接近1，常见类接近0
+        adaptive_weights /= adaptive_weights.max()  # 归一化
+
+        with torch.no_grad():
+            for key in self.shared_keys:
+                param_tensor = global_params[key]
+                for cls in self.owned_classes:
+                    cls_weight = adaptive_weights[cls].item()
+                    # 自适应噪声插值
+                    noise_std = min_std + (max_std - min_std) * cls_weight
+                    noise = torch.randn_like(param_tensor[cls]) * noise_std
+                    param_tensor[cls] = 0.9 * param_tensor[cls] + 0.1 * noise
+
+        self.globalHead.load_state_dict(global_params)
+
+    def resample_with_entropy_adaptive_noise(self, base_std=0.01, min_std=0.005, max_std=0.05):
+        """
+        使用预测熵控制扰动强度，熵越高扰动越大
+        """
+        import torch.nn.functional as F
+
+        global_params = self.globalHead.state_dict()
+        logits_dict = {cls: [] for cls in self.owned_classes}
+
+        # 收集每类预测的logits
+        self.model.eval()
+        loader = self.get_train_loader()
+        with torch.no_grad():
+            for x_batch, y_batch in loader:
+                x_batch = x_batch.to(self.device)
+                y_batch = y_batch.to(self.device)
+                features = self.model.base(x_batch)
+                logits = self.globalHead(features)
+                for logit, label in zip(logits, y_batch):
+                    logits_dict[label.item()].append(logit)
+
+        # 计算每类平均预测熵
+        entropy_dict = {}
+        for cls, logit_list in logits_dict.items():
+            if not logit_list:
+                entropy_dict[cls] = 0.0  # 无数据视为确定
+                continue
+            stacked_logits = torch.stack(logit_list)
+            probs = F.softmax(stacked_logits, dim=1)
+            entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=1).mean()
+            entropy_dict[cls] = entropy.item()
+
+        # 归一化熵
+        entropy_tensor = torch.tensor([entropy_dict.get(cls, 0.0) for cls in self.owned_classes])
+        entropy_norm = (entropy_tensor - entropy_tensor.min()) / (entropy_tensor.max() - entropy_tensor.min() + 1e-6)
+        entropy_dict_norm = dict(zip(self.owned_classes, entropy_norm.tolist()))
+
+        # 使用归一化熵加权扰动
+        with torch.no_grad():
+            for key in self.shared_keys:
+                param_tensor = global_params[key]
+                for cls in self.owned_classes:
+                    cls_entropy_weight = entropy_dict_norm[cls]
+                    noise_std = min_std + (max_std - min_std) * cls_entropy_weight
+                    noise = torch.randn_like(param_tensor[cls]) * noise_std
+                    param_tensor[cls] = 0.9 * param_tensor[cls] + 0.1 * noise
+
+        self.globalHead.load_state_dict(global_params)
 
     def train(self):
         """本地训练过程"""
@@ -705,18 +835,19 @@ class ClientFedPSYSSALong(ClientBase):
         train_loader = self.get_train_loader()
 
         # 计算类别权重
-        self.class_weights = self._calculate_weights_from_statistic()
-        self.loss = nn.CrossEntropyLoss(weight=self.class_weights)
-
+        # self.class_weights = self._calculate_weights_from_statistic()
+        # self.loss = nn.CrossEntropyLoss(weight=self.class_weights)
 
         # 模型重采样
         # self.resample_global_params(gama=0.9, noise_std=0.02)
+        # self.resample_with_class_adaptive_noise()
+        # self.resample_with_entropy_adaptive_noise()
 
         # self.fixBase()
 
         # 动态调整alpha
         # self.adjust_alpha()
-        self.alignModels(self.globalHead)
+        # self.alignModels(self.globalHead)
         # self.fuse_global_paramsWithClassImbalanced()
 
         # 融合全局参数
@@ -765,7 +896,7 @@ class ClientFedPSYSSALong(ClientBase):
 
                 output = self.model(x)
                 # loss = self.loss_fn(output, y)
-                loss = self.loss(output, y)     # ！！！改进点①！！！
+                loss = self.loss(output, y)  # ！！！改进点①！！！
 
                 loss.backward()
                 self.optimizer.step()
@@ -790,6 +921,14 @@ class ClientFedPSYSSALong(ClientBase):
 
         # raw_feats = self.collect_feats()
         # self.aggregate(raw_feats)
+        
+        # _, proto_weights = self.collect_feats()
+        # self.upload_data = {
+        #     "model_state": self.model.state_dict(),
+        #     "proto_weights": proto_weights
+        # }
+        raw_feats, raw_scores = self.collect_feats()
+        self.aggregate(raw_feats, raw_scores)
         torch.cuda.empty_cache()
         # print("after__________>",torch.cuda.memory_allocated() / 1024 ** 2, "MB used")
 
@@ -907,7 +1046,7 @@ class ClientFedPSYSSALong(ClientBase):
         mean_prototypes_tensor = torch.stack([proto for proto in mean_prototypes if proto is not None])
         # mean_prototypes_tensor = torch.stack(mean_prototypes)
         # mean prototypes经过本地head，得到的
-        alignment_loss_fn = torch.nn.KLDivLoss(reduction='batchmean')   # 以KL散度作为损失函数
+        alignment_loss_fn = torch.nn.KLDivLoss(reduction='batchmean')  # 以KL散度作为损失函数
         # alignment_loss_fn = torch.nn.MSELoss()
 
         alignment_optimizer = torch.optim.SGD(global_head.parameters(),
@@ -931,7 +1070,7 @@ class ClientFedPSYSSALong(ClientBase):
                                      torch.nn.functional.softmax(proroGlobalLogits, dim=1))
 
             alignment_optimizer.zero_grad()
-            loss.backward()     # 用KL loss进行反向传播
+            loss.backward()  # 用KL loss进行反向传播
             alignment_optimizer.step()  # 更新全局分类头
 
         # self.plot_confusion_matrix(global_head,"After Align Confusion Matrix",self.globalEpochRound)
