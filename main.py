@@ -34,8 +34,8 @@ from src.MOON.server_MOON import ServerMOON
 from models.models import Net, BaseHeadMerge
 from src.pFedHN.server_pFedHN import ServerFedHN, generate_server_model
 from utils import save_result
-from models.ResNet import ResNet18
-from models.ResNet_T import resnet4
+# from models.ResNet import ResNet18
+from models.ResNet_T import resnet4, resnet18
 # from src.pFedLA import server_pFedLA
 from src.FPL.server_FPL import ServerFPL
 from src.FedProx.server_FedProx import ServerFedProx
@@ -182,7 +182,8 @@ def prepare_models(args):
 
     if args.modelName == 'LeNet5':
         args.model = Net(in_channels=args.in_channels, num_classes=args.num_classes,
-                         dim=dim)  # 基础分类模型，对这个模型后续训练过程不能有任何改动
+                         dim=dim, num_heads=args.num_heads, attn_dropout=args.attn_dropout,
+                         proj_dropout=args.proj_dropout)  # 基础分类模型，对这个模型后续训练过程不能有任何改动
     elif args.modelName == "ResNet18":
         args.model = ResNet18()
         args.model.conv1 = nn.Conv2d(in_channels=in_channels, out_channels=64, kernel_size=3, stride=1, padding=1,
@@ -215,7 +216,8 @@ def run(args):
             if args.model_family == "HtFE2":
                 args.models = [
                     'FedAvgCNN(in_features=args.in_channels, num_classes=args.num_classes, dim=args.FedAvgCNNDim)',
-                    'torchvision.models.resnet18(pretrained=False, num_classes=args.num_classes)',
+                    # 'torchvision.models.resnet18(pretrained=False, num_classes=args.num_classes)',
+                    'resnet18(num_classes=args.num_classes)',
                     # 'resnet4(num_classes=args.num_classes)',
                 ]
 
@@ -761,6 +763,7 @@ if __name__ == '__main__':
     parser.add_argument('--benignAlone', action='store_true', help='if every client has benignAlone')
     parser.add_argument('-m', "--model_family", type=str, default="HtFE2")
     parser.add_argument('--flType', type=str, default="HtFL")
+    # parser.add_argument('--num_heads', type=int, default=8)
     args = parser.parse_args()
     # args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.device = torch.device("cuda")
