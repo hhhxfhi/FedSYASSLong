@@ -18,6 +18,7 @@
 import torch.nn as nn
 from torch import Tensor
 from typing import Any, Callable, List, Optional
+from models.MultiHeadAttention import MultiHeadAttention
 
 
 def conv3x3(in_planes: int, out_planes: int, stride: int = 1, groups: int = 1, dilation: int = 1) -> nn.Conv2d:
@@ -169,6 +170,10 @@ class ResNet(nn.Module):
             norm_layer: Optional[Callable[..., nn.Module]] = None,
             has_bn=True,
             bn_block_num=4,
+            use_attention: bool = True,  # 是否启用注意力
+            num_heads: int = 4,  # 注意力头数
+            attn_dropout: float = 0.1,  # 注意力丢弃率
+            proj_dropout: float = 0.1,  # 投影丢弃率
     ) -> None:
         super(ResNet, self).__init__()
         if norm_layer is None:
@@ -208,6 +213,16 @@ class ResNet(nn.Module):
         )
         self.fc = nn.Linear(features[len(layers) - 1] * block.expansion, num_classes)
 
+        # 定义多头注意力模块（每个特征层后对应一个注意力模块）
+        self.use_attention = use_attention
+        if use_attention:
+            # 计算每个注意力模块的嵌入维度
+            attn_dims = [features[i] * block.expansion for i in range(len(features))]
+            self.attn_layers = nn.ModuleList([
+                self._create_attention_module(dim, num_heads, attn_dropout, proj_dropout)
+                for dim in attn_dims
+            ])
+
         # self.fc = nn.Sequential(
         #     nn.AdaptiveAvgPool2d((1, 1)),
         #     nn.Flatten(),
@@ -227,6 +242,16 @@ class ResNet(nn.Module):
                     nn.init.constant_(m.bn3.weight, 0)  # type: ignore[arg-type]
                 elif isinstance(m, BasicBlock) and m.bn2.weight is not None:
                     nn.init.constant_(m.bn2.weight, 0)  # type: ignore[arg-type]
+
+    def _create_attention_module(self, embed_dim: int, num_heads: int,
+                                 attn_dropout: float, proj_dropout: float) -> MultiHeadAttention:
+        """创建多头注意力模块"""
+        return MultiHeadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            attn_dropout=attn_dropout,
+            proj_dropout=proj_dropout
+        )
 
     def _make_layer(self, block: BasicBlock, planes: int, blocks: int,
                     stride: int = 1, dilate: bool = False, has_bn=True) -> List:
@@ -268,11 +293,30 @@ class ResNet(nn.Module):
         for i in range(len(self.layers)):
             layer = getattr(self, f'layer_{i}')
             x = layer(x)
+            # 应用对应的注意力模块
+            if self.use_attention and i < len(self.attn_layers):
+                x = self._apply_attention(x, self.attn_layers[i])
 
         x = self.avgpool(x)
         x = self.fc(x)
 
         return x
+
+    def _apply_attention(self, x: Tensor, attention_module: MultiHeadAttention) -> Tensor:
+        """应用多头注意力模块（处理维度转换）"""
+        batch_size, channels, height, width = x.size()
+
+        # 1. 将特征图转换为 [batch_size, seq_len, embed_dim] 格式
+        x_seq = x.flatten(2).transpose(1, 2)  # [batch_size, height*width, channels]
+
+        # 2. 应用注意力模块
+        x_attention = attention_module(x_seq)  # 输出格式: [batch_size, height*width, channels]
+
+        # 3. 恢复为原始特征图维度
+        x_attention = x_attention.transpose(1, 2).view(batch_size, channels, height, width)
+
+        # 4. 残差连接
+        return x_attention + x
 
     def forward(self, x: Tensor) -> Tensor:
         return self._forward_impl(x)
